@@ -1,0 +1,5 @@
+{
+  "name": "OmniResearch Semantic Engine",
+  "description": "An automated RAG research pipeline UI that synthesizes document repositories into structured intelligence reports.",
+  "requestFramePermissions": []
+}
