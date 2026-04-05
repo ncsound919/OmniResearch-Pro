@@ -4,7 +4,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
-import { randomUUID } from "crypto";
+import { randomUUID, randomBytes } from "crypto";
 import fs from "fs";
 
 dotenv.config();
@@ -83,13 +83,18 @@ const agentStore = new Map<string, AgentState>();
 
 // ─── Google OAuth State ─────────────────────────────────────────────────────────
 
-let googleTokens: any = null;
+let googleTokens: { access_token?: string; refresh_token?: string; expiry_date?: number } | null = null;
+const pendingOAuthStates = new Map<string, number>();
+const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/api/google/callback';
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(cors());
+  app.use(cors({
+    origin: ['http://localhost:3000', 'http://localhost:5173'],
+    credentials: true,
+  }));
   app.use(express.json({ limit: '50mb' }));
 
   // API Routes
@@ -171,8 +176,9 @@ async function startServer() {
           mode: "simulation",
         });
       }
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      console.error('Ollama generate error:', error);
+      res.status(500).json({ error: 'Internal server error' });
     }
   });
 
@@ -261,8 +267,9 @@ async function startServer() {
         : [];
 
       return res.json({ results });
-    } catch (error: any) {
-      return res.status(500).json({ error: error.message });
+    } catch (error) {
+      console.error('Web search error:', error);
+      return res.status(500).json({ error: 'Internal server error' });
     }
   });
 
@@ -286,9 +293,9 @@ async function startServer() {
       });
       
       res.json({ success: true, ts: result.ts });
-    } catch (error: any) {
+    } catch (error) {
       console.error("Slack error:", error);
-      res.status(500).json({ error: error.message });
+      res.status(500).json({ error: 'Internal server error' });
     }
   });
 
@@ -339,9 +346,9 @@ async function startServer() {
       });
       
       res.json({ success: true, url: (response as any).url });
-    } catch (error: any) {
+    } catch (error) {
       console.error("Notion error:", error);
-      res.status(500).json({ error: error.message });
+      res.status(500).json({ error: 'Internal server error' });
     }
   });
 
@@ -368,6 +375,21 @@ async function startServer() {
         startedAt: new Date().toISOString(),
       };
 
+      // Enforce agent store size limit
+      if (agentStore.size >= 100) {
+        // Remove oldest completed agent
+        let oldestKey: string | null = null;
+        let oldestTime = Infinity;
+        for (const [key, a] of agentStore) {
+          const createdAt = new Date(a.startedAt).getTime();
+          if (a.status !== 'running' && createdAt < oldestTime) {
+            oldestTime = createdAt;
+            oldestKey = key;
+          }
+        }
+        if (oldestKey) agentStore.delete(oldestKey);
+      }
+
       agentStore.set(id, agent);
       res.json({ id, status: 'queued' });
 
@@ -380,8 +402,9 @@ async function startServer() {
           a.error = err.message || 'Unknown error';
         }
       });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (error) {
+      console.error('Agent run error:', error);
+      res.status(500).json({ error: 'Internal server error' });
     }
   });
 
@@ -435,25 +458,38 @@ async function startServer() {
       const oauth2Client = new google.auth.OAuth2(
         clientId,
         clientSecret,
-        'http://localhost:3000/api/google/callback'
+        REDIRECT_URI
       );
+
+      const state = randomBytes(16).toString('hex');
+      pendingOAuthStates.set(state, Date.now());
+      // Clean up old states (older than 10 minutes)
+      for (const [k, v] of pendingOAuthStates) {
+        if (Date.now() - v > 600000) pendingOAuthStates.delete(k);
+      }
 
       const url = oauth2Client.generateAuthUrl({
         access_type: 'offline',
         scope: ['https://www.googleapis.com/auth/drive.readonly'],
         prompt: 'consent',
+        state,
       });
 
       res.json({ url });
-    } catch (error: any) {
+    } catch (error) {
       console.error("Google auth URL error:", error);
-      res.status(500).json({ error: error.message });
+      res.status(500).json({ error: 'Internal server error' });
     }
   });
 
   app.get("/api/google/callback", async (req, res) => {
     try {
-      const code = req.query.code as string;
+      const { code, state } = req.query;
+      if (!state || !pendingOAuthStates.has(state as string)) {
+        return res.status(403).json({ error: 'Invalid OAuth state - possible CSRF' });
+      }
+      pendingOAuthStates.delete(state as string);
+
       if (!code) {
         return res.status(400).send("Missing authorization code.");
       }
@@ -462,10 +498,10 @@ async function startServer() {
       const oauth2Client = new google.auth.OAuth2(
         process.env.GOOGLE_CLIENT_ID,
         process.env.GOOGLE_CLIENT_SECRET,
-        'http://localhost:3000/api/google/callback'
+        REDIRECT_URI
       );
 
-      const { tokens } = await oauth2Client.getToken(code);
+      const { tokens } = await oauth2Client.getToken(code as string);
       googleTokens = tokens;
       oauth2Client.setCredentials(tokens);
 
@@ -480,9 +516,9 @@ async function startServer() {
           </body>
         </html>
       `);
-    } catch (error: any) {
+    } catch (error) {
       console.error("Google callback error:", error);
-      res.status(500).send(`Authentication failed: ${error.message}`);
+      res.status(500).send("Authentication failed. Please try again.");
     }
   });
 
@@ -500,7 +536,7 @@ async function startServer() {
       const oauth2Client = new google.auth.OAuth2(
         process.env.GOOGLE_CLIENT_ID,
         process.env.GOOGLE_CLIENT_SECRET,
-        'http://localhost:3000/api/google/callback'
+        REDIRECT_URI
       );
       oauth2Client.setCredentials(googleTokens);
 
@@ -513,9 +549,9 @@ async function startServer() {
       });
 
       res.json({ files: response.data.files || [] });
-    } catch (error: any) {
+    } catch (error) {
       console.error("Google Drive files error:", error);
-      res.status(500).json({ error: error.message });
+      res.status(500).json({ error: 'Internal server error' });
     }
   });
 
@@ -529,7 +565,7 @@ async function startServer() {
       const oauth2Client = new google.auth.OAuth2(
         process.env.GOOGLE_CLIENT_ID,
         process.env.GOOGLE_CLIENT_SECRET,
-        'http://localhost:3000/api/google/callback'
+        REDIRECT_URI
       );
       oauth2Client.setCredentials(googleTokens);
 
@@ -558,9 +594,9 @@ async function startServer() {
       }
 
       res.json({ filename: fileName, text, mimeType });
-    } catch (error: any) {
+    } catch (error) {
       console.error("Google Drive download error:", error);
-      res.status(500).json({ error: error.message });
+      res.status(500).json({ error: 'Internal server error' });
     }
   });
 
@@ -685,9 +721,9 @@ async function startServer() {
         text,
         size: fileBuffer.length,
       });
-    } catch (error: any) {
+    } catch (error) {
       console.error("File extraction error:", error);
-      res.status(500).json({ error: error.message });
+      res.status(500).json({ error: 'Internal server error' });
     }
   });
 
@@ -743,7 +779,7 @@ Apply the following specialized analytical lenses to this report:
 ${a.modules.map(m => `- ${m}`).join('\n')}
 ` : ''}
 
-Invent 3-5 realistic-sounding books, datasets, or magazines to use as your reference base.
+Cite any specific sources you reference. If you cannot cite real sources, note that claims are based on general industry knowledge.
 `;
 
       a.progress = 30;
