@@ -13,11 +13,15 @@ export interface SavedReport {
 export interface AgentTask {
   id: string;
   name: string;
-  status: 'running' | 'completed' | 'failed';
+  status: 'queued' | 'running' | 'completed' | 'failed';
   progress: number;
   sector: string;
   focus: string;
+  depth: string;
+  format: string;
+  modules: string[];
   startedAt: string;
+  result?: string;
 }
 
 interface AppState {
