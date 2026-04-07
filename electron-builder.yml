@@ -1,0 +1,22 @@
+appId: com.upliftlab.omni-research-pro
+productName: OmniResearch Pro
+directories:
+  buildResources: public
+  output: release
+files:
+  - dist/**/*
+  - electron/**/*
+  - package.json
+  - node_modules/**/*
+extraResources:
+  - from: .env.example
+    to: .env.example
+win:
+  target: nsis
+nsis:
+  oneClick: true
+  perMachine: false
+mac:
+  target: dmg
+linux:
+  target: AppImage

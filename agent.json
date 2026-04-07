@@ -1,0 +1,60 @@
+{
+  "id": "omni-research-pro",
+  "slug": "omni-research-pro",
+  "name": "OmniResearch Pro",
+  "codename": "Hermes",
+  "version": "1.0.0",
+  "tier": "core",
+  "role": "Research Analyst",
+  "tagline": "AI-powered research assistant",
+  "bio": "OmniResearch Pro is your AI-powered research assistant for competitor analysis, grant preparation, and advocacy research. Connects to Google Gemini, supports local Ollama models, and integrates with Slack, Notion, and Google Drive.",
+  "personality": "analytical",
+  "voice": "thorough, evidence-based, professional",
+  "theme": {
+    "accentColor": "#6366f1",
+    "cardStyle": "default",
+    "portraitFrame": "circle",
+    "badgeColor": "#6366f1"
+  },
+  "specialties": ["research", "web-search", "document-analysis", "data-synthesis"],
+  "capabilities": [
+    { "id": "research", "label": "Research", "description": "Deep research with sourced answers from multiple AI models" },
+    { "id": "web-search", "label": "Web Search", "description": "Search the web using SearXNG or built-in search" },
+    { "id": "document-analysis", "label": "Document Analysis", "description": "Analyze uploaded documents and extract insights" },
+    { "id": "slack-share", "label": "Slack Share", "description": "Share research findings directly to Slack channels" },
+    { "id": "notion-sync", "label": "Notion Sync", "description": "Save research to Notion databases" },
+    { "id": "google-drive", "label": "Google Drive", "description": "Access and analyze files from Google Drive" }
+  ],
+  "stats": [
+    { "label": "Research", "value": 95, "color": "#6366f1" },
+    { "label": "Analysis", "value": 90, "color": "#6366f1" },
+    { "label": "Speed", "value": 80, "color": "#6366f1" },
+    { "label": "Integration", "value": 85, "color": "#6366f1" }
+  ],
+  "tags": ["research", "ai", "gemini", "ollama", "slack", "notion"],
+  "runtime": {
+    "type": "http",
+    "endpoint": "http://localhost:3000",
+    "healthPath": "/api/health",
+    "timeoutMs": 30000
+  },
+  "permissions": {
+    "canReadFiles": true,
+    "canWriteFiles": false,
+    "canRunCommands": false,
+    "canAccessInternet": true,
+    "canAccessDatabase": false,
+    "canSendEmail": false
+  },
+  "modelPreferences": {
+    "primary": "gemini-2.0-flash",
+    "fallback": "ollama/llama3"
+  },
+  "workflows": [],
+  "memoryEnabled": true,
+  "persistentMemory": false,
+  "status": "offline",
+  "installedAt": "2025-01-01T00:00:00.000Z",
+  "updatedAt": "2025-01-01T00:00:00.000Z",
+  "sourceType": "folder"
+}

@@ -1,0 +1,112 @@
+name: Release Windows EXE
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # 1. Build the React/Vite frontend into dist/
+      - name: Build frontend (Vite)
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      # 2. Bundle server.ts + all Node deps into a single CJS file using esbuild
+      - name: Bundle server with esbuild
+        run: |
+          npx esbuild server.ts `
+            --bundle `
+            --platform=node `
+            --target=node20 `
+            --format=cjs `
+            --outfile=dist/server.cjs `
+            --external:vite `
+            --external:@vitejs/plugin-react `
+            --external:@tailwindcss/vite
+
+      # 3. Package dist/server.cjs + dist/ frontend into a Windows EXE with pkg
+      - name: Install pkg
+        run: npm install -g pkg
+
+      - name: Create pkg config
+        shell: pwsh
+        run: |
+          $pkgConfig = @{
+            name    = "OmniResearch-Pro"
+            version = "1.0.0"
+            bin     = "dist/server.cjs"
+            pkg     = @{
+              assets  = @("dist/**/*")
+              targets = @("node20-win-x64")
+              outputPath = "release"
+            }
+          } | ConvertTo-Json -Depth 5
+          Set-Content -Path "pkg.json" -Value $pkgConfig
+
+      - name: Package with pkg
+        run: pkg dist/server.cjs --config pkg.json --target node20-win-x64 --output release/OmniResearch-Pro-Windows-x64.exe
+
+      - name: Determine release tag
+        id: tag
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            echo "tag=${{ github.event.inputs.tag }}" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "tag=${{ github.ref_name }}" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Create GitHub Release and upload EXE
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: OmniResearch Pro ${{ steps.tag.outputs.tag }}
+          body: |
+            ## OmniResearch Pro — Windows Installer
+
+            **Download:** `OmniResearch-Pro-Windows-x64.exe`
+
+            ### Setup
+            1. Double-click the EXE to run the server
+            2. Open your browser to `http://localhost:3000`
+            3. Set your API keys in the `.env` file next to the EXE
+
+            ### Required env vars (create `.env` next to the EXE)
+            ```
+            GEMINI_API_KEY=your_key_here
+            # Optional
+            GOOGLE_CLIENT_ID=
+            GOOGLE_CLIENT_SECRET=
+            SLACK_BOT_TOKEN=
+            NOTION_API_KEY=
+            NOTION_DATABASE_ID=
+            SEARXNG_BASE_URL=
+            OLLAMA_BASE_URL=http://127.0.0.1:11434
+            ```
+          files: release/OmniResearch-Pro-Windows-x64.exe
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
