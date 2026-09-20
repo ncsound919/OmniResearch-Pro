@@ -47,8 +47,8 @@
     "canSendEmail": false
   },
   "modelPreferences": {
-    "primary": "gemini-2.0-flash",
-    "fallback": "ollama/llama3"
+    "primary": "minicpm5-2b",
+    "fallback": "gemini-2.0-flash"
   },
   "workflows": [],
   "memoryEnabled": true,

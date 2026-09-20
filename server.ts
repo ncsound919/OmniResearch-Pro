@@ -7,18 +7,55 @@ import { fileURLToPath } from "url";
 import { randomUUID, randomBytes } from "crypto";
 import fs from "fs";
 
-dotenv.config();
+// `override: true` so this repo's .env is authoritative over inherited pm2 env
+// (pm2 pins OLLAMA_BASE_URL to the local tier; without override, .env could not
+// point the app at a different OpenAI-compatible provider).
+dotenv.config({ override: true });
+
+// Crash guards: this server hosts long local-model research runs; a stray
+// rejection must degrade the run, never take the whole process down (which
+// would strand every in-flight agent).
+process.on("unhandledRejection", (reason) => {
+  console.error("OmniResearch unhandledRejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("OmniResearch uncaughtException:", err);
+});
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DEFAULT_OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/$/, "");
-const DEFAULT_OLLAMA_MODEL = process.env.OLLAMA_MODEL || "llama3.2";
+const DEFAULT_OLLAMA_MODEL = process.env.OLLAMA_MODEL || "minicpm5-2b";
+// Optional bearer key so the same OpenAI-compatible path can also target a
+// hosted provider (e.g. DeepSeek) when the local CPU tier is too slow or is a
+// reasoning model that returns empty `content`.
+const DEFAULT_OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || "";
 const SEARXNG_BASE_URL = process.env.SEARXNG_BASE_URL?.replace(/\/$/, "");
 const MIN_SEARCH_RESULTS = 1;
 const MAX_SEARCH_RESULTS = 5;
-const OLLAMA_REQUEST_TIMEOUT_MS = 10_000;
+// Local 4B models need room for a full report; 10s only covered a warm Ollama
+// ping. On CPU-only boxes Spark decodes at ~2 tok/s, so the default is generous
+// and overridable with LOCAL_LLM_TIMEOUT_MS.
+const OLLAMA_REQUEST_TIMEOUT_MS = Number(process.env.LOCAL_LLM_TIMEOUT_MS) || 600_000;
 const SEARXNG_REQUEST_TIMEOUT_MS = 8_000;
 const MAX_UPSTREAM_ERROR_LENGTH = 300;
+
+function providerHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    ...(DEFAULT_OLLAMA_API_KEY ? { Authorization: `Bearer ${DEFAULT_OLLAMA_API_KEY}` } : {}),
+    ...extra,
+  };
+}
+
+/** Local-tier tuning only. MiniCPM is a hybrid-reasoning model that dumps
+ *  chain-of-thought and loops on the stock min_p; disable both. Never sent to a
+ *  hosted provider (they reject unknown fields). */
+function localTuningFields(): Record<string, unknown> {
+  return /127\.0\.0\.1|localhost|0\.0\.0\.0/.test(DEFAULT_OLLAMA_BASE_URL)
+    ? { min_p: 0, chat_template_kwargs: { enable_thinking: false } }
+    : {};
+}
 
 type SearxngResult = {
   title?: string;
@@ -32,6 +69,101 @@ function clamp(value: number, min: number, max: number) {
 
 function hasSearchResultMetadata(result: SearxngResult): result is Required<Pick<SearxngResult, "title" | "url">> & SearxngResult {
   return Boolean(result.url && result.title);
+}
+
+type WebSearchResult = { title: string; url: string; snippet: string };
+
+function stripHtml(input: string): string {
+  return input
+    .replace(/<[^>]*>/g, "")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;|&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** DuckDuckGo wraps result links as /l/?uddg=<encoded target>. Unwrap to the
+ *  real URL, or reject anything that is not http(s). */
+function decodeDuckDuckGoUrl(href: string): string | null {
+  try {
+    const absolute = href.startsWith("//") ? `https:${href}` : href;
+    const url = new URL(absolute, "https://duckduckgo.com");
+    const uddg = url.searchParams.get("uddg");
+    const target = uddg ? decodeURIComponent(uddg) : url.toString();
+    return /^https?:\/\//i.test(target) ? target : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Keyless live web search fallback (DuckDuckGo HTML, then the lite endpoint).
+ * This exists so "Live Web Search" works with NO API key and NO extra service
+ * when SEARXNG_BASE_URL is not configured. It parses only the public result
+ * markup; a rate-limit/CAPTCHA page yields [] and an honest warning upstream.
+ */
+async function searchDuckDuckGo(query: string, limit: number): Promise<WebSearchResult[]> {
+  const endpoints = ["https://html.duckduckgo.com/html/", "https://lite.duckduckgo.com/lite/"];
+  const body = new URLSearchParams({ q: query, kl: "us-en" }).toString();
+
+  for (const endpoint of endpoints) {
+    const controller = createTimeoutController(SEARXNG_REQUEST_TIMEOUT_MS);
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+          Accept: "text/html",
+        },
+        body,
+        signal: controller.signal,
+      });
+      controller.clear();
+      if (!response.ok) continue;
+
+      const html = await response.text();
+      const results: WebSearchResult[] = [];
+
+      const anchors = [
+        ...html.matchAll(/<a\b[^>]*class=["'][^"']*result__a[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi),
+      ];
+      const snippets = [
+        ...html.matchAll(/<a\b[^>]*class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\/a>/gi),
+      ];
+      anchors.forEach((match, index) => {
+        const url = decodeDuckDuckGoUrl(match[1]);
+        const title = stripHtml(match[2]);
+        if (url && title) results.push({ title, url, snippet: stripHtml(snippets[index]?.[1] ?? "") });
+      });
+
+      if (results.length === 0) {
+        const liteAnchors = [
+          ...html.matchAll(/<a\b[^>]*class=["'][^"']*result-link[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi),
+        ];
+        const liteSnippets = [
+          ...html.matchAll(/<td\b[^>]*class=["'][^"']*result-snippet[^"']*["'][^>]*>([\s\S]*?)<\/td>/gi),
+        ];
+        liteAnchors.forEach((match, index) => {
+          const url = decodeDuckDuckGoUrl(match[1]);
+          const title = stripHtml(match[2]);
+          if (url && title) results.push({ title, url, snippet: stripHtml(liteSnippets[index]?.[1] ?? "") });
+        });
+      }
+
+      const deduped = results.filter((r, i) => results.findIndex((x) => x.url === r.url) === i);
+      if (deduped.length > 0) return deduped.slice(0, limit);
+    } catch {
+      controller.clear();
+      continue;
+    }
+  }
+  return [];
 }
 
 function summarizePrompt(prompt: string, maxLength: number) {
@@ -89,10 +221,12 @@ const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/a
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  // Fleet mode: pm2 runs this on :3010 (OMNI_RESEARCH_URL). Standalone dev
+  // keeps the historical :3000 default.
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(cors({
-    origin: ['http://localhost:3000', 'http://localhost:5173'],
+    origin: ['http://localhost:3000', 'http://localhost:3010', 'http://localhost:5173'],
     credentials: true,
   }));
   app.use(express.json({ limit: '50mb' }));
@@ -118,13 +252,14 @@ async function startServer() {
       const ollamaTimeout = createTimeoutController(OLLAMA_REQUEST_TIMEOUT_MS);
 
       try {
-        const ollamaResponse = await fetch(`${DEFAULT_OLLAMA_BASE_URL}/api/generate`, {
+        const ollamaResponse = await fetch(`${DEFAULT_OLLAMA_BASE_URL}/v1/chat/completions`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: providerHeaders(),
           body: JSON.stringify({
             model,
-            prompt,
+            messages: [{ role: "user", content: prompt }],
             stream: false,
+            ...localTuningFields(),
           }),
           signal: ollamaTimeout.signal,
         });
@@ -151,9 +286,12 @@ async function startServer() {
         const data = await ollamaResponse.json();
         ollamaTimeout.clear();
         return res.json({
-          response: data.response,
+          response:
+            data?.choices?.[0]?.message?.content ||
+            data?.choices?.[0]?.message?.reasoning_content ||
+            "",
           model,
-          mode: "ollama",
+          mode: "local",
         });
       } catch (ollamaError) {
         ollamaTimeout.clear();
@@ -171,7 +309,7 @@ async function startServer() {
         await new Promise((resolve) => setTimeout(resolve, 1200));
 
         return res.json({
-          response: `[Ollama Local Simulation] No reachable Ollama runtime was detected at ${DEFAULT_OLLAMA_BASE_URL}. Based on the prompt: "${summarizePrompt(prompt, 80)}", here is a simulated offline synthesis preview.`,
+          response: `[Local LLM Simulation] No reachable OpenAI-compatible local server was detected at ${DEFAULT_OLLAMA_BASE_URL}. Based on the prompt: "${summarizePrompt(prompt, 80)}", here is a simulated offline synthesis preview.`,
           model,
           mode: "simulation",
         });
@@ -197,10 +335,16 @@ async function startServer() {
       }
 
       if (!SEARXNG_BASE_URL) {
+        const results = await searchDuckDuckGo(query, limit);
         return res.json({
-          results: [],
-          provider: "disabled",
-          warning: "SEARXNG_BASE_URL is not configured. Set the SEARXNG_BASE_URL environment variable to enable live open-source web search.",
+          results,
+          provider: "duckduckgo",
+          ...(results.length === 0
+            ? {
+                warning:
+                  "Keyless DuckDuckGo search returned no parseable results (the endpoint may have rate-limited). Set SEARXNG_BASE_URL for a robust provider.",
+              }
+            : {}),
         });
       }
 
@@ -230,7 +374,13 @@ async function startServer() {
           });
         }
 
-        throw error;
+        // SearXNG unreachable — fall back to keyless search rather than fail.
+        const fallbackResults = await searchDuckDuckGo(query, limit);
+        return res.json({
+          results: fallbackResults,
+          provider: "duckduckgo",
+          warning: "SearXNG unreachable; used keyless DuckDuckGo fallback.",
+        });
       }
 
       if (!searchResponse.ok) {
@@ -248,6 +398,14 @@ async function startServer() {
           searchResponse.statusText || "Upstream search provider error",
         );
 
+        const okFallback = await searchDuckDuckGo(query, limit);
+        if (okFallback.length > 0) {
+          return res.json({
+            results: okFallback,
+            provider: "duckduckgo",
+            warning: `SearXNG failed (${searchResponse.status}); used keyless DuckDuckGo fallback.`,
+          });
+        }
         return res.status(502).json({
           error: `SearXNG request failed (${searchResponse.status}). ${clientErrorDetail}`,
         });
@@ -266,7 +424,7 @@ async function startServer() {
             }))
         : [];
 
-      return res.json({ results });
+      return res.json({ results, provider: "searxng" });
     } catch (error) {
       console.error('Web search error:', error);
       return res.status(500).json({ error: 'Internal server error' });
@@ -737,12 +895,8 @@ async function startServer() {
     a.status = 'running';
     a.progress = 10;
 
+    // Local-first: Gemini is only the fallback when the local model is down.
     const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      a.status = 'failed';
-      a.error = 'GEMINI_API_KEY is not configured on the server.';
-      return;
-    }
 
     try {
       // Build the prompt (mirrors geminiService.ts logic)
@@ -759,6 +913,21 @@ async function startServer() {
         formatInstructions = `Format the output as a punchy, 60-second Instagram Reel script. Include [Visual: ...], [Text Overlay: ...], and fast-paced [Audio: ...]. Focus on high-retention hooks and rapid value delivery.`;
       } else if (a.format === 'slides') {
         formatInstructions = `Format the output as a Presentation Slide Deck. For each slide, provide 'Slide Title', 'Visual Content/Chart Description', and 'Speaker Notes'.`;
+      }
+
+      // Live grounding: fetch real web results so the report cites actual
+      // sources. Best-effort — a blocked/empty search never fails the run.
+      let liveSources = '';
+      try {
+        const q = [a.sector, a.focus].filter(Boolean).join(' ').slice(0, 200);
+        const hits = await searchDuckDuckGo(q, 5);
+        if (hits.length > 0) {
+          liveSources = `\nLIVE SOURCES (retrieved ${new Date().toISOString()} — cite these):\n${hits
+            .map((h, i) => `${i + 1}. ${h.title} — ${h.url}${h.snippet ? ` — ${h.snippet}` : ''}`)
+            .join('\n')}\n`;
+        }
+      } catch {
+        /* search is best-effort */
       }
 
       const prompt = `
@@ -779,28 +948,68 @@ Apply the following specialized analytical lenses to this report:
 ${a.modules.map(m => `- ${m}`).join('\n')}
 ` : ''}
 
-Cite any specific sources you reference. If you cannot cite real sources, note that claims are based on general industry knowledge.
-`;
+${liveSources}
+If LIVE SOURCES are listed above, you MUST ground the report in them and end with a "## Sources" section that reproduces each source URL VERBATIM. Never invent a source; if none are listed, say "no live sources were retrieved".`;
 
       a.progress = 30;
 
-      // Call Gemini API
-      const { GoogleGenAI } = await import('@google/genai');
-      const ai = new GoogleGenAI({ apiKey });
+      // Local-first: Spark-X2.5-4B via llama.cpp (OpenAI-compatible /v1).
+      let text = '';
+      const localTimeout = createTimeoutController(OLLAMA_REQUEST_TIMEOUT_MS);
+      try {
+        const localResponse = await fetch(`${DEFAULT_OLLAMA_BASE_URL}/v1/chat/completions`, {
+          method: "POST",
+          headers: providerHeaders(),
+          body: JSON.stringify({
+            model: DEFAULT_OLLAMA_MODEL,
+            messages: [{ role: "user", content: prompt }],
+            stream: false,
+            temperature: 0.4,
+            ...localTuningFields(),
+            // Bound the generation so a run finishes in a sane time.
+            max_tokens: a.depth === 'brief' ? 900 : a.depth === 'exhaustive' ? 3000 : 1800,
+          }),
+          signal: localTimeout.signal,
+        });
+        if (localResponse.ok) {
+          const data = await localResponse.json();
+          // Reasoning models put chain-of-thought in `reasoning_content` and can
+          // return an empty `content`; fall back so a report is never silently blank.
+          text =
+            data?.choices?.[0]?.message?.content ||
+            data?.choices?.[0]?.message?.reasoning_content ||
+            '';
+        } else {
+          console.warn(`Local LLM returned ${localResponse.status}; falling back to Gemini if configured.`);
+        }
+      } catch (localError) {
+        console.warn("Local LLM unavailable; falling back to Gemini if configured.", localError);
+      } finally {
+        localTimeout.clear();
+      }
 
       a.progress = 50;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-2.0-flash",
-        contents: prompt,
-      });
+      if (!text) {
+        if (!apiKey) {
+          a.status = 'failed';
+          a.error = `Local LLM at ${DEFAULT_OLLAMA_BASE_URL} unavailable and GEMINI_API_KEY is not configured.`;
+          return;
+        }
+        const { GoogleGenAI } = await import('@google/genai');
+        const ai = new GoogleGenAI({ apiKey });
+        const response = await ai.models.generateContent({
+          model: "gemini-2.0-flash",
+          contents: prompt,
+        });
+        text = response.text || '';
+      }
 
       a.progress = 90;
 
-      const text = response.text || '';
       if (!text) {
         a.status = 'failed';
-        a.error = 'Gemini returned empty response';
+        a.error = 'Model returned empty response';
         return;
       }
 
